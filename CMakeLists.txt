@@ -7,6 +7,6 @@ project(iot-hub-c-raspberrypi-getstartedkit)
 
 option(use_amqp_kit "use samples provided in the kit" ON)
 
-add_subdirectory(azure-iot-sdks/c)
+add_subdirectory(azure-iot-sdk-c)
 
 add_subdirectory(samples)
