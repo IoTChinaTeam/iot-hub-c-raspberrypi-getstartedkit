@@ -1,8 +1,7 @@
-// Copyright (c) Microsoft. All rights reserved.
+﻿// Copyright (c) Microsoft. All rights reserved.
 // Licensed under the MIT license. See LICENSE file in the project root for full license information.
 
 #ifndef WINCE
-#include "iothubtransportamqp.h"
 #include "iothubtransportmqtt.h"
 #else
 #include "iothubtransporthttp.h"
@@ -19,10 +18,11 @@
 #include <string.h>
 #include <sys/types.h>
 #include <ctype.h>
+#include <curl/curl.h>
+#include <pthread.h>
 
 #include <wiringPi.h>
 #include <wiringPiSPI.h>
-
 #include "bme280.h"
 #include "locking.h"
 #include "azure_c_shared_utility/threadapi.h"
@@ -33,21 +33,23 @@
 #endif // MBED_BUILD_TIMESTAMP
 
 
-static const char* deviceId = "RaspPi";
-static const char* deviceKey = "zIPAGUXz1T8mdCDpPmbTf3BhnCz59eWPmjSDWp6xQpo=";
-static const char* hubName = "kevindemopi80b53";
-static const char* hubSuffix = "azure-devices.net";
+static const char* deviceId = "<replace>";
+static const char* deviceKey = "<replace>";
+static const char* hubName = "<replace>";
+static const char* hubSuffix = "<replace>";
 
 static IOTHUB_CLIENT_HANDLE g_iotHubClientHandle = NULL;
 
 static const int Spi_channel = 0;
 static const int Spi_clock = 1000000L;
 
-static const int Red_led_pin = 4;
 static const int Grn_led_pin = 5;
-static int g_telemetryInterval = 5;
+
+static int g_telemetryInterval = 15;
 
 static int Lock_fd;
+static bool b_exit = false;
+
 // Define the Model
 BEGIN_NAMESPACE(Contoso);
 
@@ -77,8 +79,7 @@ WITH_DATA(DeviceProperties, DeviceProperties),
 WITH_DATA(ascii_char_ptr_no_quotes, Commands),
 
 /* Commands implemented by the device */
-WITH_ACTION(SetTemperature, int, temperature),
-WITH_ACTION(SetHumidity, int, humidity)
+WITH_ACTION(SetTemperature, int, temperature)
 );
 
 END_NAMESPACE(Contoso);
@@ -90,11 +91,29 @@ EXECUTE_COMMAND_RESULT SetTemperature(Thermostat* thermostat, int temperature)
 	return EXECUTE_COMMAND_SUCCESS;
 }
 
-EXECUTE_COMMAND_RESULT SetHumidity(Thermostat* thermostat, int humidity)
+size_t write_data(void *ptr, size_t size, size_t nmemb, FILE *stream) {
+	size_t written = fwrite(ptr, size, nmemb, stream);
+	return written;
+}
+
+bool DownloadFileFromURL(const char *url)
 {
-	(void)printf("Received humidity %d\r\n", humidity);
-	thermostat->Humidity = humidity;
-	return EXECUTE_COMMAND_SUCCESS;
+	CURL *curl;
+	FILE *fp;
+	CURLcode res;
+	char outfilename[FILENAME_MAX] = "//home//pi//fireware2.0//remote_monitoring.exe";
+	curl = curl_easy_init();
+	if (curl) {
+		fp = fopen(outfilename, "wb");
+		curl_easy_setopt(curl, CURLOPT_URL, url);
+		curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_data);
+		curl_easy_setopt(curl, CURLOPT_WRITEDATA, fp);
+		res = curl_easy_perform(curl);
+		/* always cleanup */
+		curl_easy_cleanup(curl);
+		fclose(fp);
+	}
+	return true;
 }
 
 bool GetNumberFromString(const unsigned char* text, size_t size, int* pValue)
@@ -176,7 +195,7 @@ void UpdateReportedProperties(const char* format, ...)
 void ReportConfigProperties()
 {
 	UpdateReportedProperties(
-		"{ 'Config': { 'TelemetryInterval': %d } }",
+		"{ 'Config': { 'TelemetryInterval': %d }, 'FirewareVersion': '1.0'}",
 		g_telemetryInterval);
 }
 
@@ -192,11 +211,6 @@ void OnDesiredPropertyChanged(DEVICE_TWIN_UPDATE_STATE update_state, const unsig
 {
 	printf("Property changed: %.*s\r\n", size, payload);
 
-	UpdateReportedProperties(
-		"{ 'Device': { 'LastDesiredPropertyChange': '%.*s' }}",
-		size,
-		payload);
-
 	unsigned char *p = strstr(payload, "\"TelemetryInterval\":");
 
 	int telemetryInterval;
@@ -208,16 +222,9 @@ void OnDesiredPropertyChanged(DEVICE_TWIN_UPDATE_STATE update_state, const unsig
 
 void ReportSupportedMethods()
 {
-	UpdateReportedProperties("{ 'SupportedMethods': { 'SetLight--onoff-int': 'Set light status 0 off 1 on', 'InitiateFirmwareUpdate--FwPackageUri-string': 'Updates device Firmware. Use parameter FwPackageUri to specifiy the URI of the firmware file, e.g. https://iotrmassets.blob.core.windows.net/firmwares/FW20.bin', 'PlaySound--SoundFileName-string': 'Play a sound' } }");
+	UpdateReportedProperties("{ 'SupportedMethods': { 'ChangeLightStatus--LightStatusValue-int': 'Change light status, 0 off 1 on', 'InitiateFirmwareUpdate--FwPackageUri-string': 'Updates device Firmware. Use parameter FwPackageUri to specifiy the URI of the firmware file, e.g. https://iotrmassets.blob.core.windows.net/firmwares/FW20.bin' } }");
 }
-
-void PlaySound(const unsigned char* payload, size_t size, unsigned char** response, size_t* resp_size)
-{
-	system("omxplayer /home/pi/projects/my_project/audio/my_audio.wav");
-	AllocAndPrintf(response, resp_size, "{'message': 'playing sound my_audio'}");
-}
-
-void OnMethodSetLight(const unsigned char* payload, size_t size, unsigned char** response, size_t* resp_size)
+void OnMethodChangeLightStatus(const unsigned char* payload, size_t size, unsigned char** response, size_t* resp_size)
 {
 	int lightstatus;
 	if (!GetNumberFromString(payload, size, &lightstatus))
@@ -227,8 +234,7 @@ void OnMethodSetLight(const unsigned char* payload, size_t size, unsigned char**
 	else
 	{
 		int pin = 7;
-		printf("Raspberry Pi wiringPi blink test\n");
-
+		printf("Raspberry Pi light status change\n");
 		if (wiringPiSetup() == -1)
 		{
 			AllocAndPrintf(response, resp_size, "{ 'message': 'wiring Pi set up failed' }");
@@ -238,22 +244,38 @@ void OnMethodSetLight(const unsigned char* payload, size_t size, unsigned char**
 			pinMode(pin, OUTPUT);
 			printf("LED value\n %d", lightstatus);
 			digitalWrite(pin, lightstatus);
-			AllocAndPrintf(response, resp_size, "{ 'message': 'led status: %d' }", lightstatus);
+			AllocAndPrintf(response, resp_size, "{ 'message': 'light status: %d' }", lightstatus);
+
 		}
 	}
+}
+
+void OnMethodInitiateFirmwareUpdate(const unsigned char* payload, size_t size, unsigned char** response, size_t* resp_size)
+{
+	int lightstatus;
+	if (!DownloadFileFromURL(payload))
+	{
+		AllocAndPrintf(response, resp_size, "{ 'message': 'download file failed' }");
+	}
+	else
+	{
+		printf("download from url%s\n", payload);
+		AllocAndPrintf(response, resp_size, "{ 'message': 'download the newest fireware and reboot device ' }");
+	}
+	b_exit = true;
 }
 
 int OnDeviceMethodInvoked(const char* method_name, const unsigned char* payload, size_t size, unsigned char** response, size_t* resp_size, void* userContextCallback)
 {
 	printf("Method call: name = %s, payload = %.*s\r\n", method_name, size, payload);
 
-	if (strcmp(method_name, "SetLight") == 0)
+	if (strcmp(method_name, "ChangeLightStatus") == 0)
 	{
-		OnMethodSetLight(payload, size, response, resp_size);
+		OnMethodChangeLightStatus(payload, size, response, resp_size);
 	}
-	else if (strcmp(method_name, "PlaySound") == 0)
+	else if (strcmp(method_name, "InitiateFirmwareUpdate") == 0)
 	{
-		PlaySound(payload, size, response, resp_size);
+		OnMethodInitiateFirmwareUpdate(payload, size, response, resp_size);
 	}
 	else
 	{
@@ -440,7 +462,7 @@ void remote_monitoring_run(void)
 						thermostat->Humidity = 50;
 						thermostat->DeviceId = (char*)deviceId;
 
-						while (1)
+						while (!b_exit)
 						{
 							unsigned char*buffer;
 							size_t bufferSize;
@@ -477,17 +499,19 @@ void remote_monitoring_run(void)
 
 							ThreadAPI_Sleep(g_telemetryInterval * 1000);
 						}
+						/* wait a while before exit program*/
+						ThreadAPI_Sleep(5 * 1000);
 					}
 
 					DESTROY_MODEL_INSTANCE(thermostat);
 				}
 				IoTHubClient_Destroy(iotHubClientHandle);
-				}
-			serializer_deinit();
 			}
-		platform_deinit();
+			serializer_deinit();
 		}
+		platform_deinit();
 	}
+}
 
 int remote_monitoring_init(void)
 {
