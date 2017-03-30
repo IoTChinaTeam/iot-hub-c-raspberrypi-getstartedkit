@@ -2,7 +2,7 @@
 // Licensed under the MIT license. See LICENSE file in the project root for full license information.
 
 #ifndef WINCE
-#include "iothubtransportmqtt.h"
+#include "iothubtransportamqp.h"
 #else
 #include "iothubtransporthttp.h"
 #endif
@@ -18,13 +18,12 @@
 #include <string.h>
 #include <sys/types.h>
 #include <ctype.h>
-#include <curl/curl.h>
-#include <pthread.h>
 
 #include <wiringPi.h>
 #include <wiringPiSPI.h>
 #include "bme280.h"
 #include "locking.h"
+#include "stringhelper.h"
 #include "azure_c_shared_utility/threadapi.h"
 #include "azure_c_shared_utility/platform.h"
 
@@ -43,20 +42,26 @@ static IOTHUB_CLIENT_HANDLE g_iotHubClientHandle = NULL;
 static const int Spi_channel = 0;
 static const int Spi_clock = 1000000L;
 
-static const int Grn_led_pin = 5;
+static const int Grn_led_pin = 7;
 
 static int g_telemetryInterval = 15;
+static char g_firmwareVersion[16] = { 0 };
 
 static int Lock_fd;
-static bool b_exit = false;
+static const int wireSetupFailed = -1;
+
+/*json of supported methods*/
+static const char* supportedMethod = "{ 'SupportedMethods': { 'LightBlink': 'light blink', 'ChangeLightStatus--LightStatusValue-int'"
+									 ": 'Change light status, 0 light off, 1 light on', 'InitiateFirmwareUpdate--FwPackageUri-string':"
+									 " 'Updates device Firmware. Use parameter FwPackageUri to specifiy the URI of the firmware file, "
+									 "e.g. https://iotrmassets.blob.core.windows.net/firmwares/FW20.bin'  } }";
+
+/*json of report config*/
+static const char* reportedConfig = "{ 'Config': { 'TelemetryInterval': %d }}";
+static const char* reportedVersion = "{ 'FirmwareVersion': '%s' }";
 
 // Define the Model
 BEGIN_NAMESPACE(Contoso);
-
-DECLARE_STRUCT(SystemProperties,
-ascii_char_ptr, DeviceID,
-_Bool, Enabled
-);
 
 DECLARE_STRUCT(DeviceProperties,
 ascii_char_ptr, DeviceID,
@@ -65,9 +70,8 @@ _Bool, HubEnabledState
 
 DECLARE_MODEL(Thermostat,
 
-/* Event data (temperature, external temperature and humidity) */
+/* Event data (temperature and humidity) */
 WITH_DATA(int, Temperature),
-WITH_DATA(int, ExternalTemperature),
 WITH_DATA(int, Humidity),
 WITH_DATA(ascii_char_ptr, DeviceId),
 
@@ -76,99 +80,10 @@ WITH_DATA(ascii_char_ptr, ObjectType),
 WITH_DATA(_Bool, IsSimulatedDevice),
 WITH_DATA(ascii_char_ptr, Version),
 WITH_DATA(DeviceProperties, DeviceProperties),
-WITH_DATA(ascii_char_ptr_no_quotes, Commands),
-
-/* Commands implemented by the device */
-WITH_ACTION(SetTemperature, int, temperature)
+WITH_DATA(ascii_char_ptr_no_quotes, Commands)
 );
 
 END_NAMESPACE(Contoso);
-
-EXECUTE_COMMAND_RESULT SetTemperature(Thermostat* thermostat, int temperature)
-{
-	(void)printf("Received temperature %d\r\n", temperature);
-	thermostat->Temperature = temperature;
-	return EXECUTE_COMMAND_SUCCESS;
-}
-
-size_t write_data(void *ptr, size_t size, size_t nmemb, FILE *stream) {
-	size_t written = fwrite(ptr, size, nmemb, stream);
-	return written;
-}
-
-bool DownloadFileFromURL(const char *url)
-{
-	CURL *curl;
-	FILE *fp;
-	CURLcode res;
-	char outfilename[FILENAME_MAX] = "//home//pi//fireware2.0//remote_monitoring.exe";
-	curl = curl_easy_init();
-	if (curl) {
-		fp = fopen(outfilename, "wb");
-		curl_easy_setopt(curl, CURLOPT_URL, url);
-		curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_data);
-		curl_easy_setopt(curl, CURLOPT_WRITEDATA, fp);
-		res = curl_easy_perform(curl);
-		/* always cleanup */
-		curl_easy_cleanup(curl);
-		fclose(fp);
-	}
-	return true;
-}
-
-bool GetNumberFromString(const unsigned char* text, size_t size, int* pValue)
-{
-	const unsigned char* pStart = text;
-	for (; pStart < text + size; pStart++)
-	{
-		if (isdigit(*pStart))
-		{
-			break;
-		}
-	}
-
-	const unsigned char* pEnd = pStart + 1;
-	for (; pEnd <= text + size; pEnd++)
-	{
-		if (!isdigit(*pEnd))
-		{
-			break;
-		}
-	}
-
-	if (pStart >= text + size)
-	{
-		return false;
-	}
-
-	unsigned char buffer[16] = { 0 };
-	strncpy(buffer, pStart, pEnd - pStart);
-
-	*pValue = atoi(buffer);
-	return true;
-}
-
-/* utilities region */
-void AllocAndPrintf(unsigned char** buffer, size_t* size, const char* format, ...)
-{
-	va_list args;
-	va_start(args, format);
-	*size = vsnprintf(NULL, 0, format, args);
-	va_end(args);
-
-	*buffer = malloc(*size + 1);
-	va_start(args, format);
-	vsprintf((char*)*buffer, format, args);
-	va_end(args);
-}
-
-void AllocAndVPrintf(unsigned char** buffer, size_t* size, const char* format, va_list argptr)
-{
-	*size = vsnprintf(NULL, 0, format, argptr);
-
-	*buffer = malloc(*size + 1);
-	vsprintf((char*)*buffer, format, argptr);
-}
 
 void UpdateReportedProperties(const char* format, ...)
 {
@@ -192,21 +107,19 @@ void UpdateReportedProperties(const char* format, ...)
 	free(report);
 }
 
-void ReportConfigProperties()
-{
-	UpdateReportedProperties(
-		"{ 'Config': { 'TelemetryInterval': %d }, 'FirewareVersion': '1.0'}",
-		g_telemetryInterval);
-}
-
+/*report the new Config.TelemetryInterval while received the desire property change*/
 void OnDesiredTelemetryIntervalChanged(int telemetryInterval)
 {
 	g_telemetryInterval = telemetryInterval;
-	ReportConfigProperties();
+
+	UpdateReportedProperties(
+		reportedConfig,
+		g_telemetryInterval);
 
 	printf("Telemetry interval set to %u\r\n", g_telemetryInterval);
 }
 
+/*change config property TelemetryInterval as DesiredProperty change example*/
 void OnDesiredPropertyChanged(DEVICE_TWIN_UPDATE_STATE update_state, const unsigned char* payload, size_t size, void* userContextCallback)
 {
 	printf("Property changed: %.*s\r\n", size, payload);
@@ -220,10 +133,7 @@ void OnDesiredPropertyChanged(DEVICE_TWIN_UPDATE_STATE update_state, const unsig
 	}
 }
 
-void ReportSupportedMethods()
-{
-	UpdateReportedProperties("{ 'SupportedMethods': { 'ChangeLightStatus--LightStatusValue-int': 'Change light status, 0 off 1 on', 'InitiateFirmwareUpdate--FwPackageUri-string': 'Updates device Firmware. Use parameter FwPackageUri to specifiy the URI of the firmware file, e.g. https://iotrmassets.blob.core.windows.net/firmwares/FW20.bin' } }");
-}
+/*change light status on Raspberry Pi to received value*/
 void OnMethodChangeLightStatus(const unsigned char* payload, size_t size, unsigned char** response, size_t* resp_size)
 {
 	int lightstatus;
@@ -233,36 +143,83 @@ void OnMethodChangeLightStatus(const unsigned char* payload, size_t size, unsign
 	}
 	else
 	{
-		int pin = 7;
 		printf("Raspberry Pi light status change\n");
-		if (wiringPiSetup() == -1)
+		if (wiringPiSetup() == wireSetupFailed)
 		{
 			AllocAndPrintf(response, resp_size, "{ 'message': 'wiring Pi set up failed' }");
 		}
 		else
 		{
-			pinMode(pin, OUTPUT);
+			pinMode(Grn_led_pin, OUTPUT);
 			printf("LED value\n %d", lightstatus);
-			digitalWrite(pin, lightstatus);
+			digitalWrite(Grn_led_pin, lightstatus);
 			AllocAndPrintf(response, resp_size, "{ 'message': 'light status: %d' }", lightstatus);
 
 		}
 	}
 }
 
-void OnMethodInitiateFirmwareUpdate(const unsigned char* payload, size_t size, unsigned char** response, size_t* resp_size)
+void OnMethodFirmwareUpdate(const unsigned char* payload, size_t size, unsigned char** response, size_t* resp_size)
 {
-	int lightstatus;
-	if (!DownloadFileFromURL(payload))
+	const unsigned char* key = "\"FwPackageUri\":";
+
+	unsigned char* p = strstr(payload, key);
+	if (p == NULL)
 	{
-		AllocAndPrintf(response, resp_size, "{ 'message': 'download file failed' }");
+		AllocAndPrintf(response, resp_size, "{ 'message': 'Invalid payload' }");
+		return;
+	}
+
+	unsigned char* pStart = strchr(p + strlen(key), '\"');
+	if (pStart == NULL)
+	{
+		AllocAndPrintf(response, resp_size, "{ 'message': 'Invalid payload' }");
+		return;
+	}
+
+	unsigned char* pEnd = strchr(pStart + 1, '\"');
+	if (pEnd == NULL)
+	{
+		AllocAndPrintf(response, resp_size, "{ 'message': 'Invalid payload' }");
+		return;
+	}
+
+	unsigned char url[1024];
+	strcpy(url, pStart + 1);
+	url[pEnd - pStart - 1] = 0;
+	printf("Updaing firmware with %s\r\n", url);
+	AllocAndPrintf(response, resp_size, "{ 'message': 'Accepted, url = %s' }", url);
+
+	int version;
+	GetNumberFromString(url, strlen(url), &version);
+	printf("Version = %d\r\n", version);
+	sprintf(g_firmwareVersion, "%d.%d", version / 10, version % 10);
+	UpdateReportedProperties(reportedVersion, g_firmwareVersion);
+
+}
+
+void OnMethodLightBlink(const unsigned char* payload, size_t size, unsigned char** response, size_t* resp_size)
+{
+	int blinkCount = 2;
+	printf("Raspberry Pi light blink\n");
+	if (wiringPiSetup() == -1)
+	{
+		AllocAndPrintf(response, resp_size, "{ 'message': 'wiring Pi set up failed' }");
 	}
 	else
 	{
-		printf("download from url%s\n", payload);
-		AllocAndPrintf(response, resp_size, "{ 'message': 'download the newest fireware and reboot device ' }");
+		while (blinkCount--)
+		{
+			pinMode(Grn_led_pin, OUTPUT);
+			printf("light on\n");
+			digitalWrite(Grn_led_pin, 1);
+			ThreadAPI_Sleep(1000);
+			printf("light off\n");
+			digitalWrite(Grn_led_pin, 0);
+			ThreadAPI_Sleep(1000);
+		}
+		AllocAndPrintf(response, resp_size, "{ 'message': 'Pi light blink success' }");
 	}
-	b_exit = true;
 }
 
 int OnDeviceMethodInvoked(const char* method_name, const unsigned char* payload, size_t size, unsigned char** response, size_t* resp_size, void* userContextCallback)
@@ -275,7 +232,11 @@ int OnDeviceMethodInvoked(const char* method_name, const unsigned char* payload,
 	}
 	else if (strcmp(method_name, "InitiateFirmwareUpdate") == 0)
 	{
-		OnMethodInitiateFirmwareUpdate(payload, size, response, resp_size);
+		OnMethodFirmwareUpdate(payload, size, response, resp_size);
+	}
+	else if (strcmp(method_name, "LightBlink") == 0)
+	{
+		OnMethodLightBlink(payload, size, response, resp_size);
 	}
 	else
 	{
@@ -369,7 +330,7 @@ void remote_monitoring_run(void)
 			config.iotHubSuffix = hubSuffix;
 			config.protocolGatewayHostName = NULL;
 #ifndef WINCE
-			config.protocol = MQTT_Protocol;
+			config.protocol = AMQP_Protocol;
 #else
 			config.protocol = HTTP_Protocol;
 #endif
@@ -454,15 +415,17 @@ void remote_monitoring_run(void)
 							STRING_delete(commandsMetadata);
 						}
 
-						ReportSupportedMethods();
-						ReportConfigProperties();
+						UpdateReportedProperties(supportedMethod);
+						UpdateReportedProperties(
+							reportedConfig,
+							g_telemetryInterval);
+						UpdateReportedProperties(reportedVersion, "1.0");
 
 						thermostat->Temperature = 50;
-						thermostat->ExternalTemperature = 55;
 						thermostat->Humidity = 50;
 						thermostat->DeviceId = (char*)deviceId;
 
-						while (!b_exit)
+						while (1)
 						{
 							unsigned char*buffer;
 							size_t bufferSize;
@@ -478,17 +441,15 @@ void remote_monitoring_run(void)
 								thermostat->Humidity = humidityPct;
 								printf("Read Sensor Data: Humidity = %.1f%% Temperature = %.1f*C \n",
 									humidityPct, tempC);
-								pinMode(Grn_led_pin, OUTPUT);
 							}
 							else
 							{
 								thermostat->Temperature = 50;
-								thermostat->ExternalTemperature = 55;
 								thermostat->Humidity = 50;
 							}
 							(void)printf("Sending sensor value Temperature = %d, Humidity = %d\r\n", thermostat->Temperature, thermostat->Humidity);
 
-							if (SERIALIZE(&buffer, &bufferSize, thermostat->DeviceId, thermostat->Temperature, thermostat->Humidity, thermostat->ExternalTemperature) != CODEFIRST_OK)
+							if (SERIALIZE(&buffer, &bufferSize, thermostat->DeviceId, thermostat->Temperature, thermostat->Humidity) != CODEFIRST_OK)
 							{
 								(void)printf("Failed sending sensor value\r\n");
 							}
@@ -499,8 +460,6 @@ void remote_monitoring_run(void)
 
 							ThreadAPI_Sleep(g_telemetryInterval * 1000);
 						}
-						/* wait a while before exit program*/
-						ThreadAPI_Sleep(5 * 1000);
 					}
 
 					DESTROY_MODEL_INSTANCE(thermostat);
