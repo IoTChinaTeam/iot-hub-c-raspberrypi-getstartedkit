@@ -2,7 +2,7 @@
 // Licensed under the MIT license. See LICENSE file in the project root for full license information.
 
 #ifndef WINCE
-#include "iothubtransportamqp.h"
+#include "iothubtransportmqtt.h"
 #else
 #include "iothubtransporthttp.h"
 #endif
@@ -32,10 +32,10 @@
 #endif // MBED_BUILD_TIMESTAMP
 
 
-static const char* deviceId = "<replace>";
-static const char* deviceKey = "<replace>";
-static const char* hubName = "<replace>";
-static const char* hubSuffix = "<replace>";
+static const char* deviceId = "[Device Id]";
+static const char* deviceKey = "[Device Key]";
+static const char* hubName = "[IoTHub Name]";
+static const char* hubSuffix = "[IoTHub Suffix, i.e. azure-devices.net]";
 
 static IOTHUB_CLIENT_HANDLE g_iotHubClientHandle = NULL;
 
@@ -330,7 +330,7 @@ void remote_monitoring_run(void)
 			config.iotHubSuffix = hubSuffix;
 			config.protocolGatewayHostName = NULL;
 #ifndef WINCE
-			config.protocol = AMQP_Protocol;
+			config.protocol = MQTT_Protocol;
 #else
 			config.protocol = HTTP_Protocol;
 #endif
