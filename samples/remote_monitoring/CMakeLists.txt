@@ -10,8 +10,7 @@ if(NOT ${use_amqp_kit})
 endif()
 
 set(remote_monitoring_c_files
-remote_monitoring.c
-stringhelper.c
+	remote_monitoring.c
 )
 
 if(WIN32)
@@ -22,7 +21,6 @@ endif()
 
 set(remote_monitoring_h_files
 	remote_monitoring.h
-	stringhelper.h
 )
 
 IF(WIN32)
