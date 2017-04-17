@@ -1,6 +1,7 @@
 ﻿// Copyright (c) Microsoft. All rights reserved.
 // Licensed under the MIT license. See LICENSE file in the project root for full license information.
 
+#define _XOPEN_SOURCE
 #include "iothubtransportmqtt.h"
 #include "schemalib.h"
 #include "iothub_client.h"
@@ -13,6 +14,10 @@
 #include <sys/types.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
 
 #include <wiringPi.h>
 #include <wiringPiSPI.h>
@@ -21,6 +26,9 @@
 
 static const char* deviceId = "[Device Id]";
 static const char* connectionString = "HostName=[IoTHub Name].azure-devices.net;DeviceId=[Device Id];SharedAccessKey=[Device Key]";
+
+static char* lastUpdateBegin;
+static char* lastRebootBegin;
 
 static IOTHUB_CLIENT_HANDLE g_iotHubClientHandle = NULL;
 
@@ -100,6 +108,23 @@ METHODRETURN_HANDLE ChangeLightStatus(Thermostat* thermostat, int lightstatus)
 	return MethodReturn_Create(201, "\"light status changed\"");
 }
 
+void WriteConfig()
+{
+	FILE* fp;
+
+	if (NULL == (fp = fopen("//home//pi//lastupdate", "w")))
+	{
+		printf("Failed to open lastupdate file to write\r\n");
+	}
+	else
+	{
+		printf("last update begin value: %s\r\n", lastUpdateBegin);
+		printf("last reboot begin value: %s\r\n", lastRebootBegin);
+		fprintf(fp, "%s\r\n%s", lastUpdateBegin, lastRebootBegin);
+		fclose(fp);
+	}
+}
+
 bool GetNumberFromString(const unsigned char* text, size_t size, int* pValue)
 {
 	const unsigned char* pStart = text;
@@ -138,13 +163,7 @@ char* FormatTime(time_t* time)
 
 	struct tm* p = gmtime(time);
 
-	sprintf(buffer, "%04d-%02d-%02dT%02d:%02d:%02dZ",
-		p->tm_year + 1900,
-		p->tm_mon + 1,
-		p->tm_mday,
-		p->tm_hour,
-		p->tm_min,
-		p->tm_sec);
+	strftime(buffer, 26, "%Y-%m-%d %H:%M:%S", p);
 
 	return buffer;
 }
@@ -207,9 +226,12 @@ void* FirmwareUpdateThread(void* arg)
 	// Clear all reportes
 	UpdateReportedProperties("{ 'Method' : { 'UpdateFirmware': null } }");
 	time(&begin);
+	char * beginUpdate = FormatTime(&begin);
+	lastUpdateBegin = malloc(strlen(beginUpdate) + 1);
+	strcpy(lastUpdateBegin, beginUpdate);
 	UpdateReportedProperties(
 		"{ 'Method' : { 'UpdateFirmware': { 'Duration-s': 0, 'LastUpdate': '%s', 'Status': 'Running' } } }",
-		FormatTime(&begin));
+		beginUpdate);
 
 	time(&stepBegin);
 	UpdateReportedProperties(
@@ -254,10 +276,14 @@ void* FirmwareUpdateThread(void* arg)
 		FormatTime(&stepEnd));
 
 	time(&stepBegin);
+	char * rebootBegin = FormatTime(&stepBegin);
 	UpdateReportedProperties(
 		"{ 'Method' : { 'UpdateFirmware': { 'Reboot' : { 'Duration-s': 0, 'LastUpdate': '%s', 'Status': 'Running' } } } }",
-		FormatTime(&stepBegin));
+		rebootBegin);
 
+	lastRebootBegin = malloc(strlen(rebootBegin) + 1);
+	strcpy(lastRebootBegin, rebootBegin);
+	WriteConfig();
 	free(arg);
 	return NULL;
 }
@@ -396,7 +422,7 @@ void remote_monitoring_run(void)
 						/* Send telemetry */
 						thermostat->Temperature = 50;
 						thermostat->Humidity = 50;
-						thermostat->TelemetryInterval = 15;
+						thermostat->TelemetryInterval = 3;
 						thermostat->DeviceId = (char*)deviceId;
 
 						while (1)
