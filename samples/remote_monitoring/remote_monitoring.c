@@ -19,8 +19,8 @@
 #include "bme280.h"
 #include "locking.h"
 
-static const char* deviceId = "RaspPi";
-static const char* connectionString = "HostName=kevindemopi80b53.azure-devices.net;DeviceId=RaspPi;SharedAccessKey=6NU4+heovfsyTqxMKckKVmxlQp+WxW4oZzJmuxVPYIo=";
+static const char* deviceId = "[Device Id]";
+static const char* connectionString = "HostName=[IoTHub Name].azure-devices.net;DeviceId=[Device Id];SharedAccessKey=[Device Key]";
 
 static IOTHUB_CLIENT_HANDLE g_iotHubClientHandle = NULL;
 
