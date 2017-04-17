@@ -1,6 +1,7 @@
 ﻿// Copyright (c) Microsoft. All rights reserved.
 // Licensed under the MIT license. See LICENSE file in the project root for full license information.
 
+#define _XOPEN_SOURCE
 #include "iothubtransportmqtt.h"
 #include "schemalib.h"
 #include "iothub_client.h"
@@ -13,14 +14,21 @@
 #include <sys/types.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
 
 #include <wiringPi.h>
 #include <wiringPiSPI.h>
 #include "bme280.h"
 #include "locking.h"
 
-static const char* deviceId = "[Device Id]";
-static const char* connectionString = "HostName=[IoTHub Name].azure-devices.net;DeviceId=[Device Id];SharedAccessKey=[Device Key]";
+static char* deviceId;
+static char* connectionString;
+
+static char* lastUpdateBegin;
+static char* lastRebootBegin;
 
 static IOTHUB_CLIENT_HANDLE g_iotHubClientHandle = NULL;
 
@@ -100,6 +108,102 @@ METHODRETURN_HANDLE ChangeLightStatus(Thermostat* thermostat, int lightstatus)
 	return MethodReturn_Create(201, "\"light status changed\"");
 }
 
+
+
+time_t ReadFormatedTime(const char *time_details)
+{
+	struct tm tm;
+	strptime(time_details, "%Y-%m-%d %H:%M:%S", &tm);
+	time_t t = mktime(&tm);
+	printf("time: %s\r\n", time_details);
+	return t;
+}
+
+void WriteConfig()
+{
+	FILE* fp;
+
+	if (NULL == (fp = fopen("//home//pi//lastupdate", "w")))
+	{
+		printf("Failed to open lastupdate file to write\r\n");
+	}
+	else
+	{
+		printf("last update begin value: %s\r\n", lastUpdateBegin);
+		printf("last reboot begin value: %s\r\n", lastRebootBegin);
+		fprintf(fp, "%s\r\n%s", lastUpdateBegin, lastRebootBegin);
+		fclose(fp);
+	}
+}
+
+void LoadConfig()
+{
+	FILE* fp;
+
+	if (NULL == (fp = fopen("//home//pi//deviceInfo", "r")))
+	{
+		printf("Failed to open deviceInfo file to read\r\n");
+	}
+	else
+	{
+		char line[256] = { 0 };
+
+		for (int i = 0; i < 2; i++)
+		{
+			int length = 0;
+			if (fgets(line, sizeof(line), fp)) {
+				if (i == 0)
+				{
+					while (line[length++] != '\0');
+					deviceId = malloc(length + 1);
+					strcpy(deviceId, line);
+					printf("read device id: %s\r\n", deviceId);
+				}
+				else
+				{
+					while (line[length++] != '\0');
+					connectionString = malloc(length + 1);
+					strcpy(connectionString, line);
+					printf("read connection string: %s\r\n", connectionString);
+				}
+			}
+		}
+
+		fclose(fp);
+	}
+
+	if (NULL == (fp = fopen("//home//pi//lastupdate", "r")))
+	{
+		printf("Failed to open lastupdate file to read\r\n");
+	}
+	else
+	{
+		int length = 0;
+		char buffer[256] = { 0 };
+		for (int i = 0; i < 2; i++)
+		{
+			int length = 0;
+			if (fgets(buffer, sizeof(buffer), fp)) {
+				if (i == 0)
+				{
+					while (buffer[length++] != '\0');
+					lastUpdateBegin = malloc(length + 1);
+					strcpy(lastUpdateBegin, buffer);
+					printf("firmware update begin %s\r\n", lastUpdateBegin);
+				}
+				else
+				{
+					while (buffer[length++] != '\0');
+					lastRebootBegin = malloc(length + 1);
+					strcpy(lastRebootBegin, buffer);
+					printf("firmware update reboot %s\r\n", lastRebootBegin);
+				}
+			}
+		}
+		fclose(fp);
+	}
+}
+
 bool GetNumberFromString(const unsigned char* text, size_t size, int* pValue)
 {
 	const unsigned char* pStart = text;
@@ -138,13 +242,7 @@ char* FormatTime(time_t* time)
 
 	struct tm* p = gmtime(time);
 
-	sprintf(buffer, "%04d-%02d-%02dT%02d:%02d:%02dZ",
-		p->tm_year + 1900,
-		p->tm_mon + 1,
-		p->tm_mday,
-		p->tm_hour,
-		p->tm_min,
-		p->tm_sec);
+	strftime(buffer, 26, "%Y-%m-%d %H:%M:%S", p);
 
 	return buffer;
 }
@@ -207,9 +305,12 @@ void* FirmwareUpdateThread(void* arg)
 	// Clear all reportes
 	UpdateReportedProperties("{ 'Method' : { 'UpdateFirmware': null } }");
 	time(&begin);
+	char * beginUpdate = FormatTime(&begin);
+	lastUpdateBegin = malloc(strlen(beginUpdate) + 1);
+	strcpy(lastUpdateBegin, beginUpdate);
 	UpdateReportedProperties(
 		"{ 'Method' : { 'UpdateFirmware': { 'Duration-s': 0, 'LastUpdate': '%s', 'Status': 'Running' } } }",
-		FormatTime(&begin));
+		beginUpdate);
 
 	time(&stepBegin);
 	UpdateReportedProperties(
@@ -254,12 +355,38 @@ void* FirmwareUpdateThread(void* arg)
 		FormatTime(&stepEnd));
 
 	time(&stepBegin);
+	char * rebootBegin = FormatTime(&stepBegin);
 	UpdateReportedProperties(
 		"{ 'Method' : { 'UpdateFirmware': { 'Reboot' : { 'Duration-s': 0, 'LastUpdate': '%s', 'Status': 'Running' } } } }",
-		FormatTime(&stepBegin));
+		rebootBegin);
 
+	lastRebootBegin = malloc(strlen(rebootBegin) + 1);
+	strcpy(lastRebootBegin, rebootBegin);
+	WriteConfig();
 	free(arg);
 	return NULL;
+}
+
+void UpdateFirmwareComplete()
+{
+	if (lastRebootBegin == NULL || lastUpdateBegin == NULL)
+		return;
+	printf("start send firmware update complete");
+	time_t begin, end, stepBegin, stepEnd;
+	stepBegin = ReadFormatedTime(lastRebootBegin);
+	time(&stepEnd);
+	UpdateReportedProperties(
+		"{ 'Method' : { 'UpdateFirmware': { 'Reboot' : { 'Duration-s': %u, 'LastUpdate': '%s', 'Status': 'Complete' } } } }",
+		stepEnd - stepBegin,
+		FormatTime(&stepEnd));
+
+	begin = ReadFormatedTime(lastUpdateBegin);
+	time(&end);
+	UpdateReportedProperties(
+		"{ 'Method' : { 'UpdateFirmware': { 'Duration-s': %u, 'LastUpdate': '%s', 'Status': 'Complete' } } }",
+		end - begin,
+		FormatTime(&end));
+	printf("finsh send firmware update complete");
 }
 
 METHODRETURN_HANDLE InitiateFirmwareUpdate(Thermostat* thermostat, ascii_char_ptr FwPackageURI)
@@ -362,7 +489,7 @@ void remote_monitoring_run(void)
 				{
 					/* Set values for reported properties */
 					thermostat->Config.TelemetryInterval = 3;
-					thermostat->System.FirmwareVersion = "1.0";
+					thermostat->System.FirmwareVersion = "2.0";
 					/* Specify the signatures of the supported direct methods */
 					thermostat->SupportedMethods = supportedMethod;
 
@@ -373,6 +500,7 @@ void remote_monitoring_run(void)
 					}
 					else
 					{
+						UpdateFirmwareComplete();
 						printf("Send DeviceInfo object to IoT Hub at startup\n");
 
 						thermostat->ObjectType = "DeviceInfo";
@@ -396,7 +524,7 @@ void remote_monitoring_run(void)
 						/* Send telemetry */
 						thermostat->Temperature = 50;
 						thermostat->Humidity = 50;
-						thermostat->TelemetryInterval = 15;
+						thermostat->TelemetryInterval = 3;
 						thermostat->DeviceId = (char*)deviceId;
 
 						while (1)
@@ -508,6 +636,7 @@ int remote_monitoring_init(void)
 
 int main(void)
 {
+	LoadConfig();
 	int result = remote_monitoring_init();
 	if (result == 0)
 	{
