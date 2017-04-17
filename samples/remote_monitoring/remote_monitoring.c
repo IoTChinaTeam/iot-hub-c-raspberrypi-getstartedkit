@@ -9,16 +9,18 @@
 #include "azure_c_shared_utility/threadapi.h"
 #include "azure_c_shared_utility/platform.h"
 
+#include <ctype.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <pthread.h>
 
 #include <wiringPi.h>
 #include <wiringPiSPI.h>
 #include "bme280.h"
 #include "locking.h"
 
-static const char* deviceId = "[Device Id]";
-static const char* connectionString = "HostName=[IoTHub Name].azure-devices.net;DeviceId=[Device Id];SharedAccessKey=[Device Key]";
+static const char* deviceId = "RaspPi";
+static const char* connectionString = "HostName=kevindemopi80b53.azure-devices.net;DeviceId=RaspPi;SharedAccessKey=6NU4+heovfsyTqxMKckKVmxlQp+WxW4oZzJmuxVPYIo=";
 
 static IOTHUB_CLIENT_HANDLE g_iotHubClientHandle = NULL;
 
@@ -98,12 +100,179 @@ METHODRETURN_HANDLE ChangeLightStatus(Thermostat* thermostat, int lightstatus)
 	return MethodReturn_Create(201, "\"light status changed\"");
 }
 
+bool GetNumberFromString(const unsigned char* text, size_t size, int* pValue)
+{
+	const unsigned char* pStart = text;
+	for (; pStart < text + size; pStart++)
+	{
+		if (isdigit(*pStart))
+		{
+			break;
+		}
+	}
+
+	const unsigned char* pEnd = pStart + 1;
+	for (; pEnd <= text + size; pEnd++)
+	{
+		if (!isdigit(*pEnd))
+		{
+			break;
+		}
+	}
+
+	if (pStart >= text + size)
+	{
+		return false;
+	}
+
+	unsigned char buffer[16] = { 0 };
+	strncpy(buffer, pStart, pEnd - pStart);
+
+	*pValue = atoi(buffer);
+	return true;
+}
+
+char* FormatTime(time_t* time)
+{
+	static char buffer[128];
+
+	struct tm* p = gmtime(time);
+
+	sprintf(buffer, "%04d-%02d-%02dT%02d:%02d:%02dZ",
+		p->tm_year + 1900,
+		p->tm_mon + 1,
+		p->tm_mday,
+		p->tm_hour,
+		p->tm_min,
+		p->tm_sec);
+
+	return buffer;
+}
+
+//download file in Git hub repo via wget as example
+bool DownloadFile(ascii_char_ptr url)
+{
+	printf("Download url: %s\r\n", url);
+	char str[256];
+	sprintf(str, "wget %s", url);
+	return system(str) == 0;
+}
+
+void AllocAndVPrintf(unsigned char** buffer, size_t* size, const char* format, va_list argptr)
+{
+	*size = vsnprintf(NULL, 0, format, argptr);
+
+	*buffer = malloc(*size + 1);
+	vsprintf((char*)*buffer, format, argptr);
+}
+
+void UpdateReportedProperties(const char* format, ...)
+{
+	unsigned char* report;
+	size_t len;
+
+	va_list args;
+	va_start(args, format);
+	AllocAndVPrintf(&report, &len, format, args);
+	va_end(args);
+
+	if (IoTHubClient_SendReportedState(g_iotHubClientHandle, report, len, NULL, NULL) != IOTHUB_CLIENT_OK)
+	{
+		(void)printf("Failed to update reported properties: %.*s\r\n", len, report);
+	}
+	else
+	{
+		(void)printf("Succeeded in updating reported properties: %.*s\r\n", len, report);
+	}
+
+	free(report);
+}
+
+//unzip the target package to the specify folder, then move it the downloaded file
+void ApplyFirmware()
+{
+	system("unzip -o remote_monitoring.zip -d cmake/samples/remote_monitoring/");
+	system("sudo chmod +x firmwareupdate.sh");
+	system("sudo chmod +x cmake/samples/remote_monitoring/remote_monitoring");
+	system("rm -f remote_monitoring.zip");
+	system("nohup ./firmwareupdate.sh > /dev/null 2>&1 &");
+}
+
+void* FirmwareUpdateThread(void* arg)
+{
+	time_t begin, end, stepBegin, stepEnd;
+	printf("Firmware thread start, download url: %s\r\n", (char*)arg);
+	ascii_char_ptr url = arg;
+
+	// Clear all reportes
+	UpdateReportedProperties("{ 'Method' : { 'UpdateFirmware': null } }");
+	time(&begin);
+	UpdateReportedProperties(
+		"{ 'Method' : { 'UpdateFirmware': { 'Duration-s': 0, 'LastUpdate': '%s', 'Status': 'Running' } } }",
+		FormatTime(&begin));
+
+	time(&stepBegin);
+	UpdateReportedProperties(
+		"{ 'Method' : { 'UpdateFirmware': { 'Download' : { 'Duration-s': 0, 'LastUpdate': '%s', 'Status': 'Running' } } } }",
+		FormatTime(&stepBegin));
+
+	time(&stepEnd);
+	//downloadfile
+	if (!DownloadFile(url))
+	{
+		UpdateReportedProperties(
+			"{ 'Method' : { 'UpdateFirmware': { 'Download' : { 'Duration-s': %u, 'LastUpdate': '%s', 'Status': 'Failed' } } } }",
+			stepEnd - stepBegin,
+			FormatTime(&stepEnd));
+
+		time(&end);
+		UpdateReportedProperties(
+			"{ 'Method' : { 'UpdateFirmware': { 'Duration-s': %u, 'LastUpdate': '%s', 'Status': 'Failed' } } }",
+			end - begin,
+			FormatTime(&end));
+		return NULL;
+	}
+
+	time(&stepEnd);
+
+	UpdateReportedProperties(
+		"{ 'Method' : { 'UpdateFirmware': { 'Download' : { 'Duration-s': %u, 'LastUpdate': '%s', 'Status': 'Complete' } } } }",
+		stepEnd - stepBegin,
+		FormatTime(&stepEnd));
+
+	time(&stepBegin);
+	UpdateReportedProperties(
+		"{ 'Method' : { 'UpdateFirmware': { 'Applied' : { 'Duration-s': 0, 'LastUpdate': '%s', 'Status': 'Running' } } } }",
+		FormatTime(&stepBegin));
+
+	ApplyFirmware();
+
+	time(&stepEnd);
+	UpdateReportedProperties(
+		"{ 'Method' : { 'UpdateFirmware': { 'Applied' : { 'Duration-s': %u, 'LastUpdate': '%s', 'Status': 'Complete' } } } }",
+		stepEnd - stepBegin,
+		FormatTime(&stepEnd));
+
+	time(&stepBegin);
+	UpdateReportedProperties(
+		"{ 'Method' : { 'UpdateFirmware': { 'Reboot' : { 'Duration-s': 0, 'LastUpdate': '%s', 'Status': 'Running' } } } }",
+		FormatTime(&stepBegin));
+
+	free(arg);
+	return NULL;
+}
+
 METHODRETURN_HANDLE InitiateFirmwareUpdate(Thermostat* thermostat, ascii_char_ptr FwPackageURI)
 {
 	(void)(thermostat);
 
 	METHODRETURN_HANDLE result = MethodReturn_Create(201, "\"Initiating Firmware Update\"");
 	printf("Recieved firmware update request. Use package at: %s\r\n", FwPackageURI);
+	pthread_t tid;
+	ascii_char_ptr url = malloc(strlen(FwPackageURI) + 1);
+	strcpy(url, FwPackageURI);
+	printf("receive and strcpy url: %s\r\n", url);
+	pthread_create(&tid, NULL, &FirmwareUpdateThread, url);
 	return result;
 }
 
@@ -170,6 +339,7 @@ void remote_monitoring_run(void)
 		else
 		{
 			IOTHUB_CLIENT_HANDLE iotHubClientHandle = IoTHubClient_CreateFromConnectionString(connectionString, MQTT_Protocol);
+			g_iotHubClientHandle = iotHubClientHandle;
 			if (iotHubClientHandle == NULL)
 			{
 				printf("Failure in IoTHubClient_CreateFromConnectionString\n");
@@ -192,7 +362,7 @@ void remote_monitoring_run(void)
 				{
 					/* Set values for reported properties */
 					thermostat->Config.TelemetryInterval = 3;
-					thermostat->System.FirmwareVersion = "2.22";
+					thermostat->System.FirmwareVersion = "1.0";
 					/* Specify the signatures of the supported direct methods */
 					thermostat->SupportedMethods = supportedMethod;
 
