@@ -290,7 +290,9 @@ void UpdateReportedProperties(const char* format, ...)
 void ApplyFirmware()
 {
 	system("unzip -o remote_monitoring.zip -d cmake/samples/remote_monitoring/");
+	system("sudo mv cmake/samples/remote_monitoring/firmwarereboot.sh .");
 	system("sudo chmod +x firmwarereboot.sh");
+	system("sed -i 's/\r//' firmwarereboot.sh");
 	system("sudo chmod +x cmake/samples/remote_monitoring/remote_monitoring");
 	system("rm -f remote_monitoring.zip");
 	system("sudo nohup sh ./firmwarereboot.sh > /tmp/reboot.txt &");
