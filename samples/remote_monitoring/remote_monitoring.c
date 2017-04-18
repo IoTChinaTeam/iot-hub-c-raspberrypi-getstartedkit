@@ -387,6 +387,16 @@ void UpdateFirmwareComplete()
 		end - begin,
 		FormatTime(&end));
 	printf("finsh send firmware update complete");
+	//clean up lastupdate log
+	FILE* fp;
+	if (NULL == (fp = fopen("//home//pi//lastupdate", "w")))
+	{
+		printf("Failed to open lastupdate file to write\r\n");
+	}
+	else
+	{
+		fclose(fp);
+	}
 }
 
 METHODRETURN_HANDLE InitiateFirmwareUpdate(Thermostat* thermostat, ascii_char_ptr FwPackageURI)
